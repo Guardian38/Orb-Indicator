@@ -1,0 +1,108 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    ============================================================================
+    Defect Orb Damage Indicator - 빌드 설정
+    ============================================================================
+    이 파일의 모든 설정은 게임의 실제 모드 로더(ModManager.TryLoadMod)가
+    동작하는 방식에 근거한다. 근거는 각 항목 주석 참조.
+  -->
+
+  <PropertyGroup>
+    <!-- 게임 런타임이 net9.0(번들 9.0.7)이므로 동일 TFM으로 맞춘다. -->
+    <TargetFramework>net9.0</TargetFramework>
+
+    <!-- 모드는 게임이 동적 로드하는 라이브러리(DLL)다. 실행 파일이 아니다. -->
+    <OutputType>Library</OutputType>
+
+    <!--
+      산출 DLL 이름은 반드시 매니페스트의 id와 같아야 한다.
+      로더는 Path.Combine(mod.path, manifest.id + ".dll")로 DLL을 찾는다
+      (ModManager.cs:856). id = "orb_dmg_indicator" → orb_dmg_indicator.dll
+    -->
+    <AssemblyName>orb_dmg_indicator</AssemblyName>
+    <RootNamespace>OrbDmgIndicator</RootNamespace>
+
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+
+    <!--
+      게임은 자기 자신의 AssemblyLoadContext에 우리 DLL을 로드한다
+      (ModManager.cs:862-865, LoadFromAssemblyPath). 즉 sts2/GodotSharp/Harmony는
+      이미 게임 프로세스에 로드되어 있고, 우리가 같이 배포하면 타입이 중복 로드되어
+      "같은 이름의 다른 타입" 충돌이 난다. 따라서 참조 어셈블리는 절대 복사하지 않는다.
+    -->
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+
+    <!-- 디버깅용 PDB. 배포 시 함께 두면 스택 트레이스에 줄 번호가 찍힌다. -->
+    <DebugType>portable</DebugType>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <!--
+    참조 어셈블리 위치. 머신마다 다를 수 있으므로 속성으로 분리해 두고
+    필요하면 `dotnet build -p:GameRoot=...`로 덮어쓴다.
+  -->
+  <PropertyGroup>
+    <GameRoot Condition="'$(GameRoot)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2</GameRoot>
+    <GameData>$(GameRoot)\data_sts2_windows_x86_64</GameData>
+  </PropertyGroup>
+
+  <!--
+    게임 어셈블리 참조.
+    - Private=false : 출력 폴더로 복사하지 않음(위 설명대로 타입 충돌 방지).
+    - 버전 불일치는 게임이 AssemblyResolve 훅에서 sts2/0Harmony를 현재 로드된
+      버전으로 강제 해결해 주므로(ModManager.cs:1035-1048) 큰 문제가 아니다.
+  -->
+  <ItemGroup>
+    <Reference Include="sts2">
+      <HintPath>$(GameData)\sts2.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="GodotSharp">
+      <HintPath>$(GameData)\GodotSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(GameData)\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!--
+    참조 DLL이 실제로 있는지 빌드 초기에 검증해, 경로가 틀렸을 때
+    수백 개의 모호한 컴파일 에러 대신 명확한 메시지를 낸다.
+  -->
+  <Target Name="CheckGameAssemblies" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(GameData)\sts2.dll')"
+           Text="sts2.dll을 찾을 수 없습니다: $(GameData)\sts2.dll — GameRoot 속성을 확인하세요." />
+  </Target>
+
+  <!--
+    배포 타깃: 빌드 후 DLL/PDB/매니페스트를 게임의 mods 폴더로 복사한다.
+    로더는 실행 파일(SlayTheSpire2.exe) 옆 "mods" 디렉터리를 재귀 스캔한다
+    (ModManager.cs:241-245). 게임이 켜져 있으면 DLL이 잠겨 실패하므로
+    배포는 게임을 끈 상태에서 한다. `-p:DeployToGame=false`로 끌 수 있다.
+  -->
+  <PropertyGroup>
+    <DeployToGame Condition="'$(DeployToGame)' == ''">true</DeployToGame>
+    <ModDeployDir>$(GameRoot)\mods\orb_dmg_indicator</ModDeployDir>
+  </PropertyGroup>
+
+  <Target Name="DeployToMods" AfterTargets="Build" Condition="'$(DeployToGame)' == 'true'">
+    <MakeDir Directories="$(ModDeployDir)" />
+    <ItemGroup>
+      <DeployFiles Include="$(OutputPath)orb_dmg_indicator.dll" />
+      <DeployFiles Include="$(OutputPath)orb_dmg_indicator.pdb" Condition="Exists('$(OutputPath)orb_dmg_indicator.pdb')" />
+      <DeployFiles Include="$(MSBuildProjectDirectory)\mod_manifest.json" />
+      <!-- 현지화 .lang(JSON) 파일들. DLL 옆 localization\ 폴더로 복사 → ModLocalization이 런타임 로드.
+           번역 검수 시 이 파일만 고치면 되고 재빌드 불필요(파일은 SkipUnchangedFiles로 갱신만). -->
+      <LangFiles Include="$(MSBuildProjectDirectory)\localization\*.lang" />
+    </ItemGroup>
+    <Copy SourceFiles="@(DeployFiles)" DestinationFolder="$(ModDeployDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(LangFiles)" DestinationFolder="$(ModDeployDir)\localization" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="[orb_dmg_indicator] 배포 완료 → $(ModDeployDir)" />
+  </Target>
+
+</Project>

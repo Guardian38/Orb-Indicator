@@ -1,0 +1,7 @@
+{
+  "tooltip.title": "Orb Damage",
+  "tooltip.damage": "dmg",
+  "tooltip.remaining": "Remaining",
+  "tooltip.lethal": "Lethal",
+  "tooltip.no_orb_damage": "(no orb damage)"
+}

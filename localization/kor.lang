@@ -1,0 +1,7 @@
+{
+  "tooltip.title": "구체 데미지",
+  "tooltip.damage": "피해",
+  "tooltip.remaining": "남는 체력",
+  "tooltip.lethal": "처치",
+  "tooltip.no_orb_damage": "(유효 구체 피해 없음)"
+}

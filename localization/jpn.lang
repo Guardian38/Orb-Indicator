@@ -1,0 +1,7 @@
+{
+  "tooltip.title": "オーブダメージ",
+  "tooltip.damage": "ダメージ",
+  "tooltip.remaining": "残りHP",
+  "tooltip.lethal": "撃破",
+  "tooltip.no_orb_damage": "(オーブダメージなし)"
+}

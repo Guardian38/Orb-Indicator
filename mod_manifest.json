@@ -1,0 +1,12 @@
+{
+  "id": "orb_dmg_indicator",
+  "name": "Defect Orb Damage Indicator",
+  "author": "GuardianGD",
+  "description": "Shows incoming Defect orb damage (and Poison) on enemy health bars with kill-color prediction, plus a hover tooltip breaking down each source and the resulting HP.",
+  "version": "0.1.0",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [],
+  "affects_gameplay": false,
+  "min_game_version": "0.107.1"
+}

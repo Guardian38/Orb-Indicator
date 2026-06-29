@@ -1,0 +1,7 @@
+{
+  "tooltip.title": "弹珠伤害",
+  "tooltip.damage": "点伤害",
+  "tooltip.remaining": "剩余",
+  "tooltip.lethal": "致命",
+  "tooltip.no_orb_damage": "(无弹珠伤害)"
+}
