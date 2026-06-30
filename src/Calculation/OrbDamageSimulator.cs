@@ -10,9 +10,10 @@ namespace OrbDmgIndicator.Calculation;
 /// 순수 로직 — 게임 타입에 의존하지 않는다. 입력 <see cref="CombatSnapshot"/>은
 /// 수집 계층이 라이브로 채우며, 출력은 UI 계층이 색상·세그먼트·툴팁으로 렌더한다.
 ///
-/// 미구현(TODO): §5.1 전기 "전멸 확정" 예외. 현재는 보수적 기준선만 구현한다 —
-/// 전기 패시브/발현은 발동 시점 생존 적이 정확히 1명일 때만 예측에 반영하고,
-/// 다수 적이면 (전멸이 보장되더라도) 전기를 제외한다. 보장 판정·전원 파랑 표기는 추후.
+/// 발동 순서를 한 번 <see cref="DamageEvent"/> 시퀀스로 선형화한 뒤 순서대로 적용한다. 피해 적용
+/// 파이프라인·경량 상태·이벤트 타입은 OrbSimulationCore(<see cref="DamageKernel"/>·<see cref="DmgState"/>·
+/// <see cref="DamageEvent"/>)로 분리해 공유한다. 전기(무작위 단일)는 발동 시점 생존 적이 정확히 1명일
+/// 때만 반영한다(보수). 다수 적 전기 "전멸 확정" 표기는 후속.
 /// </summary>
 public static class OrbDamageSimulator
 {
@@ -45,97 +46,82 @@ public static class OrbDamageSimulator
     }
 
     /// <summary>
-    /// 시뮬레이션 1회의 실행 컨텍스트. 작업 상태(적·생존 목록·플레이어)와 피해 훅을 필드로 보관해
-    /// 페이즈 로직과 <see cref="ApplyOrbDmg"/>가 인자 전달 없이 공유한다.
-    /// 훅은 모든 피해 적용에 항상 끼는 횡단 관심사이므로 호출마다 넘기지 않고 여기 둔다.
+    /// 시뮬레이션 1회의 실행 컨텍스트. 플레이어·피해 훅을 보관하고, 발동 순서를 이벤트 시퀀스로 선형화해
+    /// 순서대로 적용한다.
     /// </summary>
     private sealed class Run
     {
         private readonly IDamageHook _hook;
-        private readonly List<EnemyWork> _enemies;
-        private readonly List<EnemyWork> _alive;
+        private readonly IReadOnlyList<EnemySnapshot> _enemySnaps;
         private readonly List<PlayerWork> _players;
 
         public Run(CombatSnapshot snapshot, IDamageHook hook)
         {
             _hook = hook;
-            // alive는 적 목록 순서를 유지(좌석과 무관).
-            _enemies = snapshot.Enemies.Select(e => new EnemyWork(e)).ToList();
-            _alive = new List<EnemyWork>(_enemies);
+            _enemySnaps = snapshot.Enemies;
             _players = snapshot.Players.Select(p => new PlayerWork(p)).ToList();
         }
 
         public IReadOnlyDictionary<int, EnemyResult> Execute()
         {
-            Phase1Hailstorm();
-            Phase2Passives();
-            Phase3Evokes();
+            List<DamageEvent> events = BuildEvents();
 
-            var results = new Dictionary<int, EnemyResult>(_enemies.Count);
-            foreach (EnemyWork e in _enemies)
+            // 전기는 발동 시점 생존 적이 정확히 1명일 때만 그 적에게 적용(보수). 다수 적 전멸 확정은 후속.
+            List<EnemyWork> pass = RunLinear(events, alive => alive.Count == 1 ? alive[0] : null);
+
+            var results = new Dictionary<int, EnemyResult>(pass.Count);
+            foreach (EnemyWork e in pass)
             {
                 results[e.Source.Id] = BuildResult(e);
             }
             return results;
         }
 
-        // ── Phase 1 · 우박폭풍 (전원 좌석순, 모든 alive에 1회) ──
-        private void Phase1Hailstorm()
+        // ── 이벤트 시퀀스 빌드 (명세 §3 Phase 1~3을 슬롯/좌석 순서대로 선형화) ──
+        // 피해 값·대상 방식은 적 상태와 무관(밀집·핵 등은 라이브 값에 반영)하므로 한 번 만든다.
+        private List<DamageEvent> BuildEvents()
         {
+            var events = new List<DamageEvent>();
+
+            // Phase 1 · 우박폭풍 (전원 좌석순, 모든 alive에 1회)
             foreach (PlayerWork p in _players)
             {
-                if (!p.Source.HailstormTriggers)
+                if (p.Source.HailstormTriggers)
                 {
-                    continue;
-                }
-                decimal amount = p.Source.HailstormAmount!.Value;
-                foreach (EnemyWork e in _alive.ToList())
-                {
-                    ApplyOrbDmg(e, amount, DamageCategory.Hailstorm);
+                    events.Add(new DamageEvent(SimTarget.AllAlive, p.Source.HailstormAmount!.Value, DamageCategory.Hailstorm));
                 }
             }
-        }
 
-        // ── Phase 2 · 구체 패시브 (전원 좌석순, 슬롯 좌→우 인터리브) ──
-        // 타입별 묶음이 아니라 슬롯 순서대로 처리해야 방어도 소모·사망 순서가 정확하다.
-        private void Phase2Passives()
-        {
+            // Phase 2 · 구체 패시브 (전원 좌석순, 슬롯 좌→우, 발동 횟수만큼 반복)
+            // 타입별 묶음이 아니라 슬롯 순서대로 인터리브해야 방어도 소모·사망 순서가 정확하다.
             foreach (PlayerWork p in _players)
             {
                 foreach (OrbWork orb in p.Orbs)
                 {
-                    // 패시브 발동 횟수(판금 케이블 등)만큼 반복. 매 발동 독립 처리 —
-                    // 매회 대상·방어도·생존 수를 재평가해야 정확하다.
                     for (int t = 0; t < orb.PassiveTriggerCount; t++)
                     {
                         switch (orb.Type)
                         {
                             case OrbType.Glass:
                             {
-                                // 유리는 패시브 발동마다 값이 1씩 줄어든다(게임: _passiveVal -= 1, 최소 0).
-                                // 다중 발동(판금 케이블 등)이면 t회차 값 = PassiveVal − t.
-                                // (ModifyOrbValue는 가산이라 _passiveVal−t ≥ 0인 한 정확. 예: 4 → 4,3,2…)
+                                // 발동마다 값 1 감소(게임 _passiveVal -= 1, 최소 0). t회차 = PassiveVal − t.
                                 decimal glassVal = orb.PassiveVal - t;
                                 if (glassVal > 0m)
                                 {
-                                    foreach (EnemyWork e in _alive.ToList())
-                                    {
-                                        ApplyOrbDmg(e, glassVal, DamageCategory.GlassPassive);
-                                    }
+                                    events.Add(new DamageEvent(SimTarget.AllAlive, glassVal, DamageCategory.GlassPassive));
                                 }
                                 break;
                             }
 
                             case OrbType.Lightning:
-                                // 무작위 단일 — 생존 적이 정확히 1명일 때만 예측(동적 판정).
-                                if (_alive.Count == 1)
+                                if (orb.PassiveVal > 0m)
                                 {
-                                    ApplyOrbDmg(_alive[0], orb.PassiveVal, DamageCategory.LightningPassive);
+                                    events.Add(new DamageEvent(SimTarget.Lightning, orb.PassiveVal, DamageCategory.LightningPassive));
                                 }
                                 break;
 
                             case OrbType.Dark:
-                                // 피해 없음. 발현용 누적값만 갱신: _evokeVal += PassiveVal (매 발동).
+                                // 피해 없음 — 발현용 누적값만 갱신(매 발동): _evokeVal += PassiveVal.
                                 orb.RunningEvoke += orb.PassiveVal;
                                 break;
 
@@ -144,11 +130,8 @@ public static class OrbDamageSimulator
                     }
                 }
             }
-        }
 
-        // ── Phase 3 · 그림자 소모 발현 (전원 좌석순, 마지막 슬롯부터 stacks개) ──
-        private void Phase3Evokes()
-        {
+            // Phase 3 · 그림자 소모 발현 (전원 좌석순, 마지막 슬롯부터 stacks개)
             foreach (PlayerWork p in _players)
             {
                 int stacks = p.Source.ConsumingShadowStacks;
@@ -160,104 +143,97 @@ public static class OrbDamageSimulator
                     switch (orb.Type)
                     {
                         case OrbType.Glass:
-                            foreach (EnemyWork e in _alive.ToList())
-                            {
-                                ApplyOrbDmg(e, orb.EvokeVal, DamageCategory.GlassEvoke);
-                            }
+                            events.Add(new DamageEvent(SimTarget.AllAlive, orb.EvokeVal, DamageCategory.GlassEvoke));
                             break;
 
                         case OrbType.Lightning:
-                            if (_alive.Count == 1)
+                        {
+                            // 벼락(Thunder)은 별도 줄 없이 전기 발현에 합산(같은 대상, 방어도 가능).
+                            decimal value = orb.EvokeVal + (p.Source.ThunderAmount ?? 0m);
+                            if (value > 0m)
                             {
-                                // 벼락(Thunder)은 별도 줄 없이 전기 발현에 합산(같은 대상, 방어도 가능).
-                                decimal value = orb.EvokeVal + (p.Source.ThunderAmount ?? 0m);
-                                ApplyOrbDmg(_alive[0], value, DamageCategory.LightningEvoke);
+                                events.Add(new DamageEvent(SimTarget.Lightning, value, DamageCategory.LightningEvoke));
                             }
                             break;
+                        }
 
                         case OrbType.Dark:
-                            if (_alive.Count > 0)
-                            {
-                                // 현재 alive 중 최저 HP(방어도 무시 선정).
-                                EnemyWork target = _alive.OrderBy(e => e.Hp).First();
-                                ApplyOrbDmg(target, orb.RunningEvoke, DamageCategory.DarkEvoke);
-                            }
+                            // 값은 누적 _evokeVal로 결정론이나, 대상(최저 HP)은 적용 시점 상태에 의존한다
+                            // (직전 전기 타격이 최저 HP 적을 바꿀 수 있음).
+                            events.Add(new DamageEvent(SimTarget.LowestHp, orb.RunningEvoke, DamageCategory.DarkEvoke));
                             break;
 
                         // Frost / Plasma: 발현 피해 없음.
                     }
                 }
             }
+
+            return events;
+        }
+
+        // ── 선형 패스 — 이벤트를 순서대로 적용, 전기 대상은 정책(델리게이트)으로 위임 ──
+        private List<EnemyWork> RunLinear(List<DamageEvent> events, Func<List<EnemyWork>, EnemyWork?> lightning)
+        {
+            var enemies = _enemySnaps.Select(s => new EnemyWork(s)).ToList();
+            var alive = new List<EnemyWork>(enemies);
+
+            foreach (DamageEvent ev in events)
+            {
+                switch (ev.Target)
+                {
+                    case SimTarget.AllAlive:
+                        foreach (EnemyWork e in alive.ToList())
+                        {
+                            ApplyOrbDmg(e, ev.Value, ev.Category, alive);
+                        }
+                        break;
+
+                    case SimTarget.LowestHp:
+                        if (alive.Count > 0)
+                        {
+                            // 적용 시점의 최저 HP(직전 전기 반영). 동률은 가장 이른 슬롯(OrderBy 안정 정렬).
+                            EnemyWork target = alive.OrderBy(e => e.State.Hp).First();
+                            ApplyOrbDmg(target, ev.Value, ev.Category, alive);
+                        }
+                        break;
+
+                    case SimTarget.Lightning:
+                        if (alive.Count == 0)
+                        {
+                            break; // 대상 없음.
+                        }
+                        EnemyWork? hit = lightning(alive);
+                        if (hit != null)
+                        {
+                            ApplyOrbDmg(hit, ev.Value, ev.Category, alive);
+                        }
+                        break;
+                }
+            }
+
+            return enemies;
         }
 
         /// <summary>
-        /// 구체 계열 1회 피해 적용 — 게임 피해 파이프라인을 그대로 따른다:
-        /// ① 방어도 이전 보정(Cap: 영체화·HardToKill 등) → ② 방어도 차감 → ③ HP 손실 보정(단단한 껍질·Buffer 등).
-        /// 유효 피해를 기록하고 사망을 처리한다. 중독(방어도 관통)은 시뮬레이션하지 않고
-        /// 스냅샷 수치로 색상·잔여체력만 계산한다.
+        /// 구체 계열 1회 피해 적용(EnemyWork 경로) — <see cref="DamageKernel"/>로 게임 파이프라인을 통과시키고
+        /// 유효 피해를 카테고리·총합에 기록한다. 사망 시 생존 목록에서 제거한다.
         /// </summary>
-        private void ApplyOrbDmg(EnemyWork e, decimal raw, DamageCategory category)
+        private void ApplyOrbDmg(EnemyWork e, decimal raw, DamageCategory category, List<EnemyWork> alive)
         {
-            if (raw <= 0m || !e.IsAlive)
-            {
-                return;
-            }
-
-            // ① 방어도 이전: 가산·승산·상한. 영체화는 여기서 타격을 1로 깎아 방어도 손실까지 제한한다.
-            decimal dmg = _hook.Cap(e.Source.Id, raw);
-            if (dmg <= 0m)
-            {
-                return;
-            }
-
-            // ② 방어도 차감.
-            decimal absorbed = Math.Min(e.Block, dmg);
-            e.Block -= absorbed;
-
-            decimal toHp = dmg - absorbed;
+            decimal toHp = DamageKernel.Apply(ref e.State, _hook, raw);
             if (toHp <= 0m)
             {
-                return; // 방어도에 완전 흡수 → 툴팁·세그먼트에서 제외.
-            }
-
-            // ③ HP 손실 보정 — 소모형(시뮬레이터가 잔여 예산을 직접 추적해 다중 타격에 정확).
-            // 게임 순서(훅 단계): 단단한 껍질(BeforeOstyLate) → 미끈거림(AfterOsty) → Buffer(AfterOstyLate).
-            if (e.ShellRemaining.HasValue)
-            {
-                // 단단한 껍질: 이번 턴 누적 HP 손실 상한. 남은 예산만큼만 입히고 그만큼 소모.
-                decimal applied = Math.Min(toHp, e.ShellRemaining.Value);
-                e.ShellRemaining = e.ShellRemaining.Value - applied;
-                toHp = applied;
-                if (toHp <= 0m)
-                {
-                    // 껍질이 전부 흡수 → 미끈거림·Buffer 미소모(조기 반환, B-1과 동일 근사).
-                    return;
-                }
-            }
-            if (e.SlipperyRemaining > 0 && toHp >= 1m)
-            {
-                // 미끈거림: 1 이상 HP 손실을 1로 캡하고 스택 1 소모(SlipperyPower.ModifyHpLostAfterOsty).
-                // 게임 소모 판정은 방어도 미차감 피해(UnblockedDamage≥1)지만 여기 도달 = toHp≥1이라 동치.
-                toHp = 1m;
-                e.SlipperyRemaining--;
-            }
-            if (e.BufferRemaining > 0)
-            {
-                // Buffer: 이 타격의 HP 손실을 통째로 무효, 1회 소모.
-                e.BufferRemaining--;
                 return;
             }
-
-            e.Hp -= toHp;
             e.OrbDamage += toHp;
             e.AddCategoryDamage(category, toHp);
-
-            if (e.Hp <= 0m)
+            if (!e.State.Alive)
             {
-                e.IsAlive = false;
-                _alive.Remove(e);
+                alive.Remove(e);
             }
         }
+
+        // ── 출력 ──
 
         private static EnemyResult BuildResult(EnemyWork e)
         {
@@ -266,12 +242,10 @@ public static class OrbDamageSimulator
 
             // 중독은 적 턴 시작에 발동 — 단단한 껍질 예산이 그 직전 리셋되므로(BeforeSideTurnStart),
             // 아군 턴 구체 소모와 독립인 새 전체 예산(Amount)으로 상한된다. 껍질의 턴 누적 상한
-            // 특성상 다중 발동(촉매제)이어도 총 HP 손실 = min(총 중독, Amount). (구체용 잔여 예산
-            // HpLossCapThisTurn=DisplayAmount와 다른 값임에 주의.)
+            // 특성상 다중 발동(촉매제)이어도 총 HP 손실 = min(총 중독, Amount).
             decimal p = ComputePoison(e);
 
-            // §4① 막타 기준 색상 — 시간순 누적 임계. 종말(보라)은 판정하지 않고 vanilla에 위임:
-            // 구체+중독으로 죽지 않으면 None을 반환해 게임 체력바 색상(종말 보라 포함)을 그대로 둔다.
+            // §4① 막타 기준 색상 — 시간순 누적 임계. 종말(보라)은 판정하지 않고 vanilla에 위임한다.
             KillSource kill;
             if (o >= h)
             {
@@ -311,19 +285,14 @@ public static class OrbDamageSimulator
         }
 
         /// <summary>
-        /// 적 턴 시작 중독의 유효 HP 손실. 미끈거림(Slippery) 미보유면 기존 단순 상한
-        /// (= min(총 중독, 껍질 전체 예산))을 그대로 쓴다.
-        ///
-        /// 미끈거림 보유 시: 중독은 매 발동이 별도 HP 손실 인스턴스라 미끈거림이 인스턴스마다 1로 캡한다.
-        /// i번째 발동 = `PoisonAmount − i`(게임 PoisonPower), 발동 횟수 = PoisonTriggerCount(촉매제 포함).
-        /// 각 인스턴스에 단단한 껍질(턴 전체 예산, 소모형) → 미끈거림(1로 캡, 스택 1 소모) 순으로 적용한다.
-        /// 미끈거림 스택은 구체 페이즈(아군 턴 종료, 시간상 먼저)에서 이미 소비된 잔여(<see cref="EnemyWork.SlipperyRemaining"/>)를
-        /// 쓴다 — 구체가 먼저 깎고 중독은 남은 스택만 받는 게임 순서와 일치.
-        /// (껍질이 손실을 전부 흡수하면 미끈거림 미소모 근사 — 단, 껍질+미끈거림 동시 적은 vanilla에 없음. known_issues E-2.)
+        /// 적 턴 시작 중독의 유효 HP 손실. 미끈거림(Slippery) 미보유면 단순 상한(min(총 중독, 껍질 전체 예산)).
+        /// 미끈거림 보유 시: 중독은 매 발동이 별도 HP 손실 인스턴스라 인스턴스마다 1로 캡한다.
+        /// i번째 발동 = `PoisonAmount − i`, 발동 횟수 = PoisonTriggerCount. 각 인스턴스에 단단한 껍질(턴 전체
+        /// 예산, 소모형) → 미끈거림(1로 캡, 스택 1 소모) 순. 미끈거림 스택은 구체 페이즈가 먼저 소비한 잔여를 쓴다.
         /// </summary>
         private static decimal ComputePoison(EnemyWork e)
         {
-            if (e.SlipperyRemaining <= 0 || e.Source.PoisonTriggerCount <= 0)
+            if (e.State.Slip <= 0 || e.Source.PoisonTriggerCount <= 0)
             {
                 decimal total = e.Source.Poison;
                 if (e.Source.PoisonHpLossCap.HasValue)
@@ -334,13 +303,12 @@ public static class OrbDamageSimulator
             }
 
             decimal shellBudget = e.Source.PoisonHpLossCap ?? decimal.MaxValue;
-            int slip = e.SlipperyRemaining;
+            int slip = e.State.Slip;
             decimal sum = 0m;
             for (int i = 0; i < e.Source.PoisonTriggerCount; i++)
             {
                 decimal inst = e.Source.PoisonAmount - i; // 게임: i번째 발동 피해 = Amount − i
 
-                // 단단한 껍질: 턴 전체 예산에서 차감(소모형).
                 decimal applied = Math.Min(inst, shellBudget);
                 shellBudget -= applied;
                 inst = applied;
@@ -349,7 +317,6 @@ public static class OrbDamageSimulator
                     continue; // 껍질 전부 흡수 → 미끈거림 미소모(근사).
                 }
 
-                // 미끈거림: 1 이상 HP 손실을 1로 캡하고 스택 1 소모.
                 if (slip > 0 && inst >= 1m)
                 {
                     inst = 1m;
@@ -359,48 +326,33 @@ public static class OrbDamageSimulator
             }
             return sum;
         }
-    }
 
-    /// <summary>툴팁에 나오는 구체 카테고리(발동 시간순). 중독은 별도로 뒤에 붙인다.</summary>
-    private static readonly DamageCategory[] OrbCategoryOrder =
-    {
-        DamageCategory.Hailstorm,
-        DamageCategory.LightningPassive,
-        DamageCategory.GlassPassive,
-        DamageCategory.DarkEvoke,
-        DamageCategory.LightningEvoke,
-        DamageCategory.GlassEvoke,
-    };
+        /// <summary>툴팁에 나오는 구체 카테고리(발동 시간순). 중독은 별도로 뒤에 붙인다.</summary>
+        private static readonly DamageCategory[] OrbCategoryOrder =
+        {
+            DamageCategory.Hailstorm,
+            DamageCategory.LightningPassive,
+            DamageCategory.GlassPassive,
+            DamageCategory.DarkEvoke,
+            DamageCategory.LightningEvoke,
+            DamageCategory.GlassEvoke,
+        };
+    }
 
     // ── 내부 작업 구조 ──
 
     private sealed class EnemyWork
     {
         public EnemySnapshot Source { get; }
-        public decimal Hp;
-        public decimal Block;
+        public DmgState State;
         public decimal OrbDamage;
-        public bool IsAlive = true;
-
-        /// <summary>단단한 껍질 잔여 HP 손실 상한(소모형). null = 미보유.</summary>
-        public decimal? ShellRemaining;
-
-        /// <summary>Buffer 잔여 무효화 횟수(소모형).</summary>
-        public int BufferRemaining;
-
-        /// <summary>미끈거림 잔여 스택(소모형). 1 이상 HP 손실을 1로 캡하고 1씩 깎는다.</summary>
-        public int SlipperyRemaining;
 
         private readonly Dictionary<DamageCategory, decimal> _categoryDamage = new();
 
         public EnemyWork(EnemySnapshot src)
         {
             Source = src;
-            Hp = src.Hp;
-            Block = src.Block;
-            ShellRemaining = src.HpLossCapThisTurn;
-            BufferRemaining = src.BufferStacks;
-            SlipperyRemaining = src.SlipperyStacks;
+            State = DmgState.From(src);
         }
 
         public void AddCategoryDamage(DamageCategory cat, decimal amount)
@@ -437,7 +389,7 @@ public static class OrbDamageSimulator
         public decimal EvokeVal { get; }
         public int PassiveTriggerCount { get; }
 
-        /// <summary>암흑 발현값 — Phase 2에서 패시브 누적(_evokeVal += PassiveVal)을 반영.</summary>
+        /// <summary>암흑 발현값 — 이벤트 빌드 중 패시브 누적(_evokeVal += PassiveVal)을 반영.</summary>
         public decimal RunningEvoke;
 
         public OrbWork(OrbSnapshot o)
