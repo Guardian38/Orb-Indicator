@@ -24,6 +24,9 @@ public static class ModEntry
 
     private static Harmony? _harmony;
 
+    /// <summary>런타임 Harmony 인스턴스 — 약한 의존 연계(BetterSpire2 등)가 늦은 시점에 추가 패치할 때 쓴다.</summary>
+    internal static Harmony? Harmony => _harmony;
+
     public static void Initialize()
     {
         // 게임의 Log를 그대로 쓰면 모드 메시지가 게임 로그 파일에 함께 남아
@@ -40,5 +43,9 @@ public static class ModEntry
 
         int patched = _harmony.GetPatchedMethods().Count();
         Log.Info($"[{ModId}] loaded. Applied {patched} Harmony patch(es).");
+
+        // 약한 의존 연계 1차 시도(BetterSpire2 받는 피해 seed). 모드 로드 순서가 보장되지 않아
+        // 이 시점엔 BetterSpire2가 아직 안 떴을 수 있으므로, 미감지면 첫 전투 때 재시도한다(PredictionService).
+        Compat.BetterSpire2Interop.EnsurePatched(loadComplete: false);
     }
 }
