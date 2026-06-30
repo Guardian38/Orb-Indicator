@@ -40,6 +40,9 @@ internal static class PredictionService
 
     private static IReadOnlyDictionary<int, EnemyResult>? GetResults(ICombatState? combat)
     {
+        // 전투 중(=모든 모드 로드 완료 보장) 약한 의존 연계 패치를 확정 시도한다. 이미 해결됐으면 즉시 반환(멱등).
+        Compat.BetterSpire2Interop.EnsurePatched(loadComplete: true);
+
         ulong frame = Engine.GetProcessFrames();
         if (_cacheFrame == frame)
         {
