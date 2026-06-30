@@ -5,15 +5,18 @@ using System.Linq;
 namespace OrbDmgIndicator.Calculation;
 
 /// <summary>
-/// 턴 종료 해소 순서를 그대로 시뮬레이션해 적별 결과를 산출한다(명세 §3·§4).
+/// 턴 종료 해소 순서를 그대로 시뮬레이션해 적별 결과를 산출한다(명세 §3·§4·§5.1).
 ///
 /// 순수 로직 — 게임 타입에 의존하지 않는다. 입력 <see cref="CombatSnapshot"/>은
 /// 수집 계층이 라이브로 채우며, 출력은 UI 계층이 색상·세그먼트·툴팁으로 렌더한다.
 ///
-/// 발동 순서를 한 번 <see cref="DamageEvent"/> 시퀀스로 선형화한 뒤 순서대로 적용한다. 피해 적용
-/// 파이프라인·경량 상태·이벤트 타입은 OrbSimulationCore(<see cref="DamageKernel"/>·<see cref="DmgState"/>·
-/// <see cref="DamageEvent"/>)로 분리해 공유한다. 전기(무작위 단일)는 발동 시점 생존 적이 정확히 1명일
-/// 때만 반영한다(보수). 다수 적 전기 "전멸 확정" 표기는 후속.
+/// 전기(무작위 단일)는 두 가지로 다룬다:
+/// ① <b>보수 패스</b> — 발동 시점 생존 적이 정확히 1명일 때만 그 적에게 적용(기본 표시).
+/// ② <b>전멸 확정(§5.1)</b> — 다수 적이어도 전기로 전멸이 보장되면, 그 보장을 만든 한 분기(witness)의 실제
+///    전기 피해를 반영해 전원 파랑(구체 처치) 표기. 보장 판정은 <see cref="LightningWipeSolver"/>에 위임한다.
+///
+/// 발동 순서를 한 번 <see cref="DamageEvent"/> 시퀀스로 선형화한 뒤, 보수 패스와 witness 패스가 같은
+/// 시퀀스를 공유한다(순서 일관성). 전멸 DFS도 같은 시퀀스를 받아 판정하므로 세 경로가 갈라지지 않는다.
 /// </summary>
 public static class OrbDamageSimulator
 {
@@ -47,7 +50,7 @@ public static class OrbDamageSimulator
 
     /// <summary>
     /// 시뮬레이션 1회의 실행 컨텍스트. 플레이어·피해 훅을 보관하고, 발동 순서를 이벤트 시퀀스로 선형화해
-    /// 순서대로 적용한다.
+    /// 보수 패스·전멸 DFS·witness 패스가 공유한다.
     /// </summary>
     private sealed class Run
     {
@@ -66,8 +69,19 @@ public static class OrbDamageSimulator
         {
             List<DamageEvent> events = BuildEvents();
 
-            // 전기는 발동 시점 생존 적이 정확히 1명일 때만 그 적에게 적용(보수). 다수 적 전멸 확정은 후속.
+            // ① 보수 패스 — 전기는 생존 적이 정확히 1명일 때만 그 적에게(기본 동작).
             List<EnemyWork> pass = RunLinear(events, alive => alive.Count == 1 ? alive[0] : null);
+
+            // ② 전멸 확정(§5.1) — 보수 패스로 살아남은 다수 적이 있고 전기 이벤트가 있을 때만 판정.
+            //    전기로 전멸이 보장되면, 그 보장을 만든 한 분기(witness)를 그대로 재생해 전원 처치 수치로 표기.
+            if (!AllDead(pass) && pass.Count > 1 && events.Any(e => e.Target == SimTarget.Lightning))
+            {
+                var solver = new LightningWipeSolver(_enemySnaps, events, _hook);
+                if (solver.TryFindGuaranteedWipe(out List<int> witness))
+                {
+                    pass = RunLinear(events, WitnessStrategy(witness));
+                }
+            }
 
             var results = new Dictionary<int, EnemyResult>(pass.Count);
             foreach (EnemyWork e in pass)
@@ -215,6 +229,31 @@ public static class OrbDamageSimulator
         }
 
         /// <summary>
+        /// witness 패스용 전기 대상 정책 — DFS가 찾은 전멸 분기의 대상 id 열을 순서대로 소비한다.
+        /// 선형 패스의 전기 이벤트 순서 = DFS 이벤트 순서라 정렬이 맞는다. (방어적으로 id 미발견 시 첫 생존 적.)
+        /// </summary>
+        private static Func<List<EnemyWork>, EnemyWork?> WitnessStrategy(List<int> witness)
+        {
+            int k = 0;
+            return alive =>
+            {
+                if (k >= witness.Count)
+                {
+                    return alive.Count > 0 ? alive[0] : null;
+                }
+                int id = witness[k++];
+                foreach (EnemyWork e in alive)
+                {
+                    if (e.Source.Id == id)
+                    {
+                        return e;
+                    }
+                }
+                return alive.Count > 0 ? alive[0] : null;
+            };
+        }
+
+        /// <summary>
         /// 구체 계열 1회 피해 적용(EnemyWork 경로) — <see cref="DamageKernel"/>로 게임 파이프라인을 통과시키고
         /// 유효 피해를 카테고리·총합에 기록한다. 사망 시 생존 목록에서 제거한다.
         /// </summary>
@@ -231,6 +270,18 @@ public static class OrbDamageSimulator
             {
                 alive.Remove(e);
             }
+        }
+
+        private static bool AllDead(List<EnemyWork> enemies)
+        {
+            foreach (EnemyWork e in enemies)
+            {
+                if (e.State.Alive)
+                {
+                    return false;
+                }
+            }
+            return true;
         }
 
         // ── 출력 ──
