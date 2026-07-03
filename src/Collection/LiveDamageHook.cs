@@ -42,8 +42,10 @@ public sealed class LiveDamageHook : OrbDamageSimulator.IDamageHook
             return raw;
         }
         // 방어도 이전: 가산·승산·상한 전부. 영체화·HardToKill 상한이 여기서 적용된다.
+        // cardPlay: 2026-07-03 게임 업데이트에서 ModifyDamage에 추가된 매개변수. 구체는 카드 플레이가 아니므로
+        // cardSource와 동일하게 null(카드 관련 보정은 Unpowered 구체에 무관).
         return Hook.ModifyDamage(
-            _run, _combat, target, dealer: null, raw, OrbProps, cardSource: null,
+            _run, _combat, target, dealer: null, raw, OrbProps, cardSource: null, cardPlay: null,
             ModifyDamageHookType.All, CardPreviewMode.None, out _);
     }
 }
